@@ -1,0 +1,209 @@
+name: Desktop Release (Draft First)
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Release action'
+        required: true
+        type: choice
+        options:
+          - build-draft
+          - promote-draft
+        default: build-draft
+      tag:
+        description: 'Existing git tag (example: v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '20'
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.semver.outputs.release_tag }}
+    steps:
+      - name: Validate semantic version tag
+        id: semver
+        shell: bash
+        run: |
+          TAG="${{ env.RELEASE_TAG }}"
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "Tag '$TAG' is not a valid semantic version tag (expected vMAJOR.MINOR.PATCH)." >&2
+            exit 1
+          fi
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    if: github.event_name == 'push' || github.event.inputs.action == 'build-draft'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            dist_command: npm run dist:win
+          - os: macos-latest
+            platform: macos
+            dist_command: npm run dist:mac
+
+    env:
+      WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+      WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+      MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+      MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.release_tag }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Validate signing and notarization secrets
+        shell: bash
+        run: |
+          missing=()
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            [[ -z "$WIN_CSC_LINK" ]] && missing+=("WIN_CSC_LINK")
+            [[ -z "$WIN_CSC_KEY_PASSWORD" ]] && missing+=("WIN_CSC_KEY_PASSWORD")
+          else
+            [[ -z "$MAC_CSC_LINK" ]] && missing+=("MAC_CSC_LINK")
+            [[ -z "$MAC_CSC_KEY_PASSWORD" ]] && missing+=("MAC_CSC_KEY_PASSWORD")
+            [[ -z "$APPLE_ID" ]] && missing+=("APPLE_ID")
+            [[ -z "$APPLE_APP_SPECIFIC_PASSWORD" ]] && missing+=("APPLE_APP_SPECIFIC_PASSWORD")
+            [[ -z "$APPLE_TEAM_ID" ]] && missing+=("APPLE_TEAM_ID")
+          fi
+
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing required secrets for %s build:\n' "${{ matrix.platform }}" >&2
+            printf ' - %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
+
+      - name: Smoke checks
+        run: npm run smoke
+
+      - name: Package artifacts
+        run: ${{ matrix.dist_command }}
+        env:
+          CSC_LINK: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_LINK || secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_KEY_PASSWORD || secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_TEAM_ID || '' }}
+
+      - name: Stage artifacts + checksums
+        run: node scripts/release/prepare-artifacts.mjs ${{ matrix.platform }} dist release-assets/${{ matrix.platform }}
+
+      - name: Upload staged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.platform }}
+          path: release-assets/${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-draft:
+    needs:
+      - validate
+      - build
+    if: github.event_name == 'push' || github.event.inputs.action == 'build-draft'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.release_tag }}
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-windows
+          path: release-assets/windows
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-macos
+          path: release-assets/macos
+
+      - name: Build combined checksums file
+        shell: bash
+        run: |
+          cat release-assets/windows/SHA256SUMS-windows.txt release-assets/macos/SHA256SUMS-macos.txt > release-assets/SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: node scripts/release/generate-release-notes.mjs ${{ needs.validate.outputs.release_tag }} release-assets/RELEASE_NOTES.md
+
+      - name: Publish draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.release_tag }}
+          name: Release ${{ needs.validate.outputs.release_tag }}
+          draft: true
+          body_path: release-assets/RELEASE_NOTES.md
+          overwrite_files: true
+          files: |
+            release-assets/windows/*.exe
+            release-assets/windows/*.zip
+            release-assets/macos/*.dmg
+            release-assets/macos/*.zip
+            release-assets/SHA256SUMS.txt
+            release-assets/windows/SHA256SUMS-windows.txt
+            release-assets/macos/SHA256SUMS-macos.txt
+            release-assets/RELEASE_NOTES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  promote-draft:
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'promote-draft'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "${{ needs.validate.outputs.release_tag }}" --json name,isDraft > /tmp/release.json
+
+      - name: Promote draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ needs.validate.outputs.release_tag }}" --draft=false
+
+      - name: Confirm published state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "${{ needs.validate.outputs.release_tag }}" --json name,isDraft,url

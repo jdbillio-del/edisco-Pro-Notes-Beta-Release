@@ -1,0 +1,18 @@
+.DS_Store
+node_modules/
+apps/desktop/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local app data (notes, docs, todos, timelines, attachments)
+/data/local/
+**/attachments/
+**/edisconotes.sqlite
+**/edisconotes.db
+**/*.sqlite
+**/*.db
+
+# Build output
+apps/desktop/dist/
+dist/

@@ -1,0 +1,17 @@
+{
+  "name": "edisconotes",
+  "private": true,
+  "workspaces": [
+    "apps/desktop"
+  ],
+  "scripts": {
+    "dev": "npm --prefix apps/desktop run dev",
+    "build": "npm --prefix apps/desktop run build",
+    "dist:win": "npm --prefix apps/desktop run dist:win",
+    "dist:mac": "npm --prefix apps/desktop run dist:mac",
+    "dist": "npm --prefix apps/desktop run dist",
+    "lint": "npm --prefix apps/desktop run lint",
+    "test": "npm --prefix apps/desktop run test",
+    "smoke": "npm --prefix apps/desktop run smoke"
+  }
+}
