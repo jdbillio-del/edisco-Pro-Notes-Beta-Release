@@ -103,6 +103,40 @@ const inlineMarkdown = (value: string) =>
 
 const normalizeEditorText = (value: string) => value.replace(/\u00a0/g, " ");
 
+const ALLOWED_EDITOR_TAGS = new Set(["h1", "h2", "h3", "h4", "p", "ul", "ol", "li", "blockquote", "strong", "em", "mark", "code", "br", "div"]);
+
+const sanitizeEditorHtml = (html: string) => {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+
+  const sanitizeNode = (node: Node): Node | null => {
+    if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.textContent || "");
+    if (!(node instanceof HTMLElement)) return null;
+
+    const tag = node.tagName.toLowerCase();
+    const fragment = document.createDocumentFragment();
+    Array.from(node.childNodes).forEach((child) => {
+      const cleaned = sanitizeNode(child);
+      if (cleaned) fragment.appendChild(cleaned);
+    });
+
+    if (!ALLOWED_EDITOR_TAGS.has(tag)) {
+      return fragment;
+    }
+
+    const next = document.createElement(tag);
+    next.appendChild(fragment);
+    return next;
+  };
+
+  const out = document.createElement("div");
+  Array.from(template.content.childNodes).forEach((child) => {
+    const cleaned = sanitizeNode(child);
+    if (cleaned) out.appendChild(cleaned);
+  });
+  return out.innerHTML;
+};
+
 const inlineNodeToMarkdown = (node: Node): string => {
   if (node.nodeType === Node.TEXT_NODE) {
     return normalizeEditorText(node.textContent || "");
@@ -201,7 +235,7 @@ const blockNodeToMarkdown = (node: Node): string => {
 
 const htmlToMarkdown = (html: string) => {
   const container = document.createElement("div");
-  container.innerHTML = html;
+  container.innerHTML = sanitizeEditorHtml(html);
   return blockNodesToMarkdown(Array.from(container.childNodes))
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -965,7 +999,7 @@ const App: React.FC = () => {
     const editor = richEditorRef.current;
     if (!editor) return;
     if (document.activeElement === editor) return;
-    const html = noteDraft.trim() ? markdownToHtml(noteDraft) : "";
+    const html = noteDraft.trim() ? sanitizeEditorHtml(markdownToHtml(noteDraft)) : "";
     if (editor.innerHTML !== html) {
       editor.innerHTML = html;
     }
@@ -1648,6 +1682,20 @@ const App: React.FC = () => {
       event.preventDefault();
       runRichCommand(event.shiftKey ? "outdent" : "indent");
     }
+  };
+
+  const handleRichEditorPaste = (event: React.ClipboardEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const html = event.clipboardData.getData("text/html");
+    const text = event.clipboardData.getData("text/plain");
+    const safeHtml = html ? sanitizeEditorHtml(html) : "";
+    if (safeHtml) {
+      document.execCommand("insertHTML", false, safeHtml);
+    } else {
+      document.execCommand("insertText", false, text);
+    }
+    syncRichEditorToDraft();
+    refreshRichToolState();
   };
 
   const addTodo = async () => {
@@ -2789,6 +2837,7 @@ const App: React.FC = () => {
                           onInput={syncRichEditorToDraft}
                           onBlur={syncRichEditorToDraft}
                           onKeyDown={handleRichEditorKeyDown}
+                          onPaste={handleRichEditorPaste}
                         />
                       </div>
                       <p className={`muted ${noteSaveTone}`} aria-live="polite">{noteSaveMessage}</p>
