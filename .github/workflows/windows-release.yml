@@ -212,14 +212,14 @@ jobs:
       - name: Ensure release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release view "${{ needs.validate.outputs.release_tag }}" --json name,isDraft > /tmp/release.json
+        run: gh release view "${{ needs.validate.outputs.release_tag }}" --repo "${{ github.repository }}" --json name,isDraft > /tmp/release.json
 
       - name: Promote draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ needs.validate.outputs.release_tag }}" --draft=false
+        run: gh release edit "${{ needs.validate.outputs.release_tag }}" --repo "${{ github.repository }}" --draft=false
 
       - name: Confirm published state
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release view "${{ needs.validate.outputs.release_tag }}" --json name,isDraft,url
+        run: gh release view "${{ needs.validate.outputs.release_tag }}" --repo "${{ github.repository }}" --json name,isDraft,url
