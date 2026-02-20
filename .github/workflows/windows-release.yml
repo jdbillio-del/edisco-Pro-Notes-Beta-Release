@@ -113,14 +113,33 @@ jobs:
         run: npm run smoke
 
       - name: Package artifacts
-        run: ${{ matrix.dist_command }}
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-          CSC_LINK: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_LINK || secrets.MAC_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_KEY_PASSWORD || secrets.MAC_CSC_KEY_PASSWORD }}
-          APPLE_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_ID || '' }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_TEAM_ID || '' }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            if [[ -n "$WIN_CSC_LINK" && -n "$WIN_CSC_KEY_PASSWORD" ]]; then
+              export CSC_LINK="$WIN_CSC_LINK"
+              export CSC_KEY_PASSWORD="$WIN_CSC_KEY_PASSWORD"
+              echo "Windows signing env configured."
+            else
+              unset CSC_LINK CSC_KEY_PASSWORD
+              echo "Windows signing env not set; producing unsigned artifacts."
+            fi
+          else
+            if [[ -n "$MAC_CSC_LINK" && -n "$MAC_CSC_KEY_PASSWORD" && -n "$APPLE_ID" && -n "$APPLE_APP_SPECIFIC_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
+              export CSC_LINK="$MAC_CSC_LINK"
+              export CSC_KEY_PASSWORD="$MAC_CSC_KEY_PASSWORD"
+              export APPLE_ID
+              export APPLE_APP_SPECIFIC_PASSWORD
+              export APPLE_TEAM_ID
+              echo "macOS signing + notarization env configured."
+            else
+              unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
+              export CSC_IDENTITY_AUTO_DISCOVERY=false
+              echo "macOS signing env not set; producing unsigned/unnotarized artifacts."
+            fi
+          fi
+
+          ${{ matrix.dist_command }}
 
       - name: Stage artifacts + checksums
         run: node scripts/release/prepare-artifacts.mjs ${{ matrix.platform }} dist release-assets/${{ matrix.platform }}
