@@ -8,7 +8,7 @@ export default defineConfig(({ command }) => ({
     {
       name: "edisco-csp",
       transformIndexHtml(html) {
-        const connectSrc = command === "serve" ? "ws://localhost:5173 http://localhost:5173" : "'self'";
+        const connectSrc = command === "serve" ? "ws://localhost:5173 http://localhost:5173" : "https://api.edisconotes.com";
         return html.replace("__EDISCO_CONNECT_SRC__", connectSrc);
       }
     }
