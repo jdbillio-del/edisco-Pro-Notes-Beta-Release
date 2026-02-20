@@ -83,25 +83,21 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
-      - name: Validate signing and notarization secrets
+      - name: Resolve signing/notarization mode
         shell: bash
         run: |
-          missing=()
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            [[ -z "$WIN_CSC_LINK" ]] && missing+=("WIN_CSC_LINK")
-            [[ -z "$WIN_CSC_KEY_PASSWORD" ]] && missing+=("WIN_CSC_KEY_PASSWORD")
+            if [[ -n "$WIN_CSC_LINK" && -n "$WIN_CSC_KEY_PASSWORD" ]]; then
+              echo "Windows signing enabled."
+            else
+              echo "::warning::Windows signing secrets are missing. Building unsigned Windows artifacts."
+            fi
           else
-            [[ -z "$MAC_CSC_LINK" ]] && missing+=("MAC_CSC_LINK")
-            [[ -z "$MAC_CSC_KEY_PASSWORD" ]] && missing+=("MAC_CSC_KEY_PASSWORD")
-            [[ -z "$APPLE_ID" ]] && missing+=("APPLE_ID")
-            [[ -z "$APPLE_APP_SPECIFIC_PASSWORD" ]] && missing+=("APPLE_APP_SPECIFIC_PASSWORD")
-            [[ -z "$APPLE_TEAM_ID" ]] && missing+=("APPLE_TEAM_ID")
-          fi
-
-          if (( ${#missing[@]} > 0 )); then
-            printf 'Missing required secrets for %s build:\n' "${{ matrix.platform }}" >&2
-            printf ' - %s\n' "${missing[@]}" >&2
-            exit 1
+            if [[ -n "$MAC_CSC_LINK" && -n "$MAC_CSC_KEY_PASSWORD" && -n "$APPLE_ID" && -n "$APPLE_APP_SPECIFIC_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
+              echo "macOS signing + notarization enabled."
+            else
+              echo "::warning::macOS signing/notarization secrets are missing. Building unsigned/unnotarized macOS artifacts."
+            fi
           fi
 
       - name: Install deps
@@ -119,6 +115,7 @@ jobs:
       - name: Package artifacts
         run: ${{ matrix.dist_command }}
         env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
           CSC_LINK: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_LINK || secrets.MAC_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_KEY_PASSWORD || secrets.MAC_CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_ID || '' }}
