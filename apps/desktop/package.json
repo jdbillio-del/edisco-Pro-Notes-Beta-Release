@@ -11,8 +11,8 @@
     "dist:mac": "npm run build && electron-builder --mac",
     "dist": "npm run build && electron-builder",
     "preview": "vite preview",
-    "lint": "echo 'no lint configured'",
-    "test": "echo 'no tests configured'",
+    "lint": "tsc --noEmit",
+    "test": "npm run lint && npm run smoke",
     "smoke": "npm run build && node --input-type=module -e \"import { existsSync } from 'node:fs'; if (!existsSync('dist/index.html')) { throw new Error('Smoke check failed: dist/index.html missing after build.'); } console.log('Smoke check passed: dist/index.html exists.');\""
   },
   "dependencies": {

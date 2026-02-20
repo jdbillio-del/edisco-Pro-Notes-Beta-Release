@@ -57,6 +57,11 @@ const dbPlainPath = () => path.join(app.getPath("userData"), "edisconotes.sqlite
 const dbEncPath = () => path.join(app.getPath("userData"), "edisconotes.sqlite.enc");
 const PROJECT_BUNDLE_FORMAT = "edisconotes.project-bundle";
 const PROJECT_BUNDLE_VERSION = 1;
+const PROJECT_BUNDLE_MAX_BYTES = 25 * 1024 * 1024;
+const PROJECT_BUNDLE_MAX_ATTACHMENTS = 100;
+const PROJECT_BUNDLE_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const PROJECT_BUNDLE_MAX_TOTAL_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+const EXTERNAL_URL_ALLOWLIST = new Set(["help.edisconotes.com", "edisconotes.com", "www.edisconotes.com"]);
 
 const listUserDataRootsForUnlock = () => {
   return [path.resolve(app.getPath("userData"))];
@@ -324,6 +329,99 @@ const isAllowedNavigation = (targetUrl) => {
     return target.protocol === "file:";
   } catch {
     return false;
+  }
+};
+
+const ensureExternalUrl = (value) => {
+  const safeUrl = ensureHttpUrl(value, "External URL");
+  const parsed = new URL(safeUrl);
+  if (parsed.protocol !== "https:") {
+    throw new Error("External URL must use HTTPS.");
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!EXTERNAL_URL_ALLOWLIST.has(host)) {
+    throw new Error("External URL host is not allowed.");
+  }
+  return parsed.toString();
+};
+
+const estimateBase64DecodedBytes = (value) => {
+  const normalized = String(value || "").replace(/\s+/g, "");
+  if (!normalized) return 0;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) || normalized.length % 4 !== 0) {
+    throw new Error("Attachment bytes are not valid base64.");
+  }
+  const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
+  return Math.floor((normalized.length * 3) / 4) - padding;
+};
+
+const decodeBase64ToFile = async (base64Input, filePath) => {
+  const normalized = String(base64Input || "").replace(/\s+/g, "");
+  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+  const fd = fs.openSync(filePath, "w", 0o600);
+  try {
+    let carry = "";
+    const chunkSize = 1024 * 1024;
+    for (let offset = 0; offset < normalized.length; offset += chunkSize) {
+      const next = normalized.slice(offset, offset + chunkSize);
+      const joined = carry + next;
+      const decodableLen = joined.length - (joined.length % 4);
+      if (decodableLen > 0) {
+        const bytes = Buffer.from(joined.slice(0, decodableLen), "base64");
+        if (bytes.length) {
+          fs.writeSync(fd, bytes);
+        }
+      }
+      carry = joined.slice(decodableLen);
+    }
+    if (carry.length) {
+      const bytes = Buffer.from(carry, "base64");
+      if (bytes.length) {
+        fs.writeSync(fd, bytes);
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+};
+
+const writeAttachmentFromBase64 = async (projectId, originalFileName, base64) => {
+  const safeProjectId = assertUuid(projectId, "project ID");
+  const attachmentsDir = getSafeProjectAttachmentDir(safeProjectId);
+  if (!attachmentsDir) {
+    throw new Error("Project attachment path is invalid.");
+  }
+  ensureDir(attachmentsDir);
+
+  const ext = path.extname(String(originalFileName || ""));
+  const storedFileName = ENCRYPTION_ENABLED ? `${randomUUID()}${ext}.enc` : `${randomUUID()}${ext}`;
+  const storedRelativePath = path.join(safeProjectId, storedFileName);
+  const destPath = path.resolve(attachmentsDir, storedFileName);
+  if (!isContainedPath(destPath, attachmentsDir)) {
+    throw new Error("Invalid attachment destination.");
+  }
+
+  ensureDir(tempRoot());
+  const tempPath = path.resolve(tempRoot(), `${randomUUID()}${ext || ".tmp"}`);
+  try {
+    await decodeBase64ToFile(base64, tempPath);
+    const stat = fs.statSync(tempPath);
+    if (ENCRYPTION_ENABLED) {
+      await encryptAttachmentFile(tempPath, destPath, vaultState.vault.fileKey);
+    } else {
+      fs.renameSync(tempPath, destPath);
+    }
+    return {
+      storedFileName,
+      storedRelativePath,
+      sizeBytes: stat.size
+    };
+  } finally {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // ignore
+    }
   }
 };
 
@@ -2146,7 +2244,7 @@ const registerIpc = () => {
 
   ipcMain.handle("system:openExternal", async (_event, targetUrl) => {
     try {
-      const safeUrl = ensureHttpUrl(targetUrl, "External URL");
+      const safeUrl = ensureExternalUrl(targetUrl);
       await shell.openExternal(safeUrl);
       return true;
     } catch {
@@ -2391,17 +2489,63 @@ const registerIpc = () => {
     }
 
     const bundlePath = result.filePaths[0];
+    let stat;
+    try {
+      stat = fs.statSync(bundlePath);
+    } catch {
+      return { ok: false, errorCode: "BUNDLE_READ_FAILED", error: "Could not read bundle file." };
+    }
+    if (!stat.isFile()) {
+      return { ok: false, errorCode: "BUNDLE_INVALID_TYPE", error: "Bundle path is not a file." };
+    }
+    if (stat.size > PROJECT_BUNDLE_MAX_BYTES) {
+      return { ok: false, errorCode: "BUNDLE_TOO_LARGE", error: "Bundle exceeds max allowed size." };
+    }
+
     let payload;
     try {
       payload = JSON.parse(fs.readFileSync(bundlePath, "utf8"));
     } catch {
-      return { ok: false, error: "Bundle file is not valid JSON." };
+      return { ok: false, errorCode: "BUNDLE_INVALID_JSON", error: "Bundle file is not valid JSON." };
     }
-    if (!payload || payload.format !== PROJECT_BUNDLE_FORMAT || Number(payload.version) !== PROJECT_BUNDLE_VERSION) {
-      return { ok: false, error: "Bundle format is not supported." };
+
+    if (!payload || typeof payload !== "object") {
+      return { ok: false, errorCode: "BUNDLE_INVALID_PAYLOAD", error: "Bundle payload is invalid." };
+    }
+    if (payload.format !== PROJECT_BUNDLE_FORMAT || Number(payload.version) !== PROJECT_BUNDLE_VERSION) {
+      return { ok: false, errorCode: "BUNDLE_UNSUPPORTED_FORMAT", error: "Bundle format is not supported." };
     }
     if (!payload.project || typeof payload.project !== "object") {
-      return { ok: false, error: "Bundle project payload is missing." };
+      return { ok: false, errorCode: "BUNDLE_MISSING_PROJECT", error: "Bundle project payload is missing." };
+    }
+
+    const notes = Array.isArray(payload.notes) ? payload.notes : [];
+    const todos = Array.isArray(payload.todos) ? payload.todos : [];
+    const timelineTasks = Array.isArray(payload.timelineTasks) ? payload.timelineTasks : [];
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+
+    if (attachments.length > PROJECT_BUNDLE_MAX_ATTACHMENTS) {
+      return { ok: false, errorCode: "ATTACHMENTS_TOO_MANY", error: "Bundle has too many attachments." };
+    }
+
+    let decodedAttachmentTotal = 0;
+    const validatedAttachments = [];
+    for (const attachment of attachments) {
+      const originalFileName = ensureText(String(attachment?.originalFileName || "attachment.bin"), "Attachment name", { maxLen: 260 });
+      const dataBase64 = ensureText(String(attachment?.dataBase64 || ""), "Attachment bytes", { maxLen: PROJECT_BUNDLE_MAX_ATTACHMENT_BYTES * 2 });
+      const decodedBytes = estimateBase64DecodedBytes(dataBase64);
+      if (decodedBytes > PROJECT_BUNDLE_MAX_ATTACHMENT_BYTES) {
+        return { ok: false, errorCode: "ATTACHMENT_TOO_LARGE", error: `Attachment ${originalFileName} exceeds size limit.` };
+      }
+      decodedAttachmentTotal += decodedBytes;
+      if (decodedAttachmentTotal > PROJECT_BUNDLE_MAX_TOTAL_ATTACHMENT_BYTES) {
+        return { ok: false, errorCode: "ATTACHMENTS_TOTAL_TOO_LARGE", error: "Bundle attachments exceed total size limit." };
+      }
+      validatedAttachments.push({
+        originalFileName,
+        dataBase64,
+        addedAt: typeof attachment?.addedAt === "string" ? attachment.addedAt : null
+      });
     }
 
     const importedProject = {
@@ -2418,27 +2562,28 @@ const registerIpc = () => {
 
     const projectId = randomUUID();
     const timestamp = nowIso();
-    run(
-      `INSERT INTO projects
-      (id, matterName, clientName, billingCode, startDate, productionDeadline, relativityUrl, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        projectId,
-        importedProject.matterName,
-        importedProject.clientName,
-        importedProject.billingCode,
-        importedProject.startDate,
-        importedProject.productionDeadline,
-        importedProject.relativityUrl,
-        timestamp,
-        timestamp
-      ]
-    );
 
-    let importedNotes = 0;
-    const notes = Array.isArray(payload.notes) ? payload.notes : [];
-    for (const note of notes) {
-      try {
+    try {
+      run("BEGIN TRANSACTION");
+      run(
+        `INSERT INTO projects
+        (id, matterName, clientName, billingCode, startDate, productionDeadline, relativityUrl, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          projectId,
+          importedProject.matterName,
+          importedProject.clientName,
+          importedProject.billingCode,
+          importedProject.startDate,
+          importedProject.productionDeadline,
+          importedProject.relativityUrl,
+          timestamp,
+          timestamp
+        ]
+      );
+
+      let importedNotes = 0;
+      for (const note of notes) {
         const noteId = randomUUID();
         run(
           `INSERT INTO notes
@@ -2447,45 +2592,35 @@ const registerIpc = () => {
           [
             noteId,
             projectId,
-            ensureText(String(note.title || "Imported Note"), "Note title", { maxLen: 200 }),
-            ensureIsoDate(String(note.noteDate || new Date().toISOString().slice(0, 10)), "Note date"),
-            ensureText(String(note.contentMarkdown || ""), "Note content", { allowEmpty: true, minLen: 0, trim: false, maxLen: 2_000_000 }),
-            typeof note.createdAt === "string" ? note.createdAt : timestamp,
-            typeof note.updatedAt === "string" ? note.updatedAt : timestamp
+            ensureText(String(note?.title || "Imported Note"), "Note title", { maxLen: 200 }),
+            ensureIsoDate(String(note?.noteDate || new Date().toISOString().slice(0, 10)), "Note date"),
+            ensureText(String(note?.contentMarkdown || ""), "Note content", { allowEmpty: true, minLen: 0, trim: false, maxLen: 2_000_000 }),
+            typeof note?.createdAt === "string" ? note.createdAt : timestamp,
+            typeof note?.updatedAt === "string" ? note.updatedAt : timestamp
           ]
         );
         importedNotes += 1;
-      } catch (error) {
-        console.error("Skipping invalid imported note", error);
       }
-    }
 
-    let importedTodos = 0;
-    const todos = Array.isArray(payload.todos) ? payload.todos : [];
-    for (const todo of todos) {
-      try {
+      let importedTodos = 0;
+      for (const todo of todos) {
         const todoId = randomUUID();
-        const todoText = ensureText(String(todo.text || ""), "To-do text", { maxLen: 2000 });
-        const isCompleted = Boolean(todo.isCompleted);
-        const isPriority = Boolean(todo.isPriority);
+        const todoText = ensureText(String(todo?.text || ""), "To-do text", { maxLen: 2000 });
+        const isCompleted = Boolean(todo?.isCompleted);
+        const isPriority = Boolean(todo?.isPriority);
         run(
           "INSERT INTO todos (id, projectId, text, isCompleted, isPriority, createdAt, completedAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          [todoId, projectId, todoText, isCompleted ? 1 : 0, isPriority ? 1 : 0, todo.createdAt || timestamp, todo.completedAt || null]
+          [todoId, projectId, todoText, isCompleted ? 1 : 0, isPriority ? 1 : 0, todo?.createdAt || timestamp, todo?.completedAt || null]
         );
         importedTodos += 1;
-      } catch (error) {
-        console.error("Skipping invalid imported to-do", error);
       }
-    }
 
-    let importedTimeline = 0;
-    const timelineTasks = Array.isArray(payload.timelineTasks) ? payload.timelineTasks : [];
-    for (const task of timelineTasks) {
-      try {
+      let importedTimeline = 0;
+      for (const task of timelineTasks) {
         const sanitized = sanitizeTimelineInput({
-          phase: task.phase,
-          startDate: task.startDate || null,
-          endDate: task.endDate || null
+          phase: task?.phase,
+          startDate: task?.startDate || null,
+          endDate: task?.endDate || null
         });
         if (!sanitized.startDate && !sanitized.endDate) continue;
         const timelineId = randomUUID();
@@ -2499,26 +2634,16 @@ const registerIpc = () => {
             sanitized.phase,
             sanitized.startDate,
             sanitized.endDate,
-            typeof task.createdAt === "string" ? task.createdAt : timestamp,
-            typeof task.updatedAt === "string" ? task.updatedAt : timestamp
+            typeof task?.createdAt === "string" ? task.createdAt : timestamp,
+            typeof task?.updatedAt === "string" ? task.updatedAt : timestamp
           ]
         );
         importedTimeline += 1;
-      } catch (error) {
-        console.error("Skipping invalid imported timeline row", error);
       }
-    }
 
-    let importedAttachments = 0;
-    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
-    for (const attachment of attachments) {
-      try {
-        const originalFileName = ensureText(String(attachment.originalFileName || "attachment.bin"), "Attachment name", {
-          maxLen: 260
-        });
-        const base64 = ensureText(String(attachment.dataBase64 || ""), "Attachment bytes", { maxLen: 256 * 1024 * 1024 });
-        const bytes = Buffer.from(base64, "base64");
-        const stored = await writeAttachmentFromPlaintextBuffer(projectId, originalFileName, bytes);
+      let importedAttachments = 0;
+      for (const attachment of validatedAttachments) {
+        const stored = await writeAttachmentFromBase64(projectId, attachment.originalFileName, attachment.dataBase64);
         const attachmentId = randomUUID();
         run(
           `INSERT INTO attachments
@@ -2527,43 +2652,50 @@ const registerIpc = () => {
           [
             attachmentId,
             projectId,
-            originalFileName,
+            attachment.originalFileName,
             stored.storedFileName,
             stored.storedRelativePath,
             stored.sizeBytes,
-            typeof attachment.addedAt === "string" ? attachment.addedAt : timestamp
+            attachment.addedAt || timestamp
           ]
         );
         importedAttachments += 1;
-      } catch (error) {
-        console.error("Skipping invalid imported attachment", error);
       }
-    }
 
-    recordAudit({
-      action: "project.bundle.import",
-      entityType: "project",
-      entityId: projectId,
-      projectId,
-      details: {
-        bundlePath,
-        importedNotes,
-        importedTodos,
-        importedTimeline,
-        importedAttachments
+      run("COMMIT");
+      recordAudit({
+        action: "project.bundle.import",
+        entityType: "project",
+        entityId: projectId,
+        projectId,
+        details: {
+          bundlePath,
+          importedNotes,
+          importedTodos,
+          importedTimeline,
+          importedAttachments
+        }
+      });
+      persistDb();
+      return {
+        ok: true,
+        project: get("SELECT * FROM projects WHERE id = ?", [projectId]),
+        counts: {
+          notes: importedNotes,
+          todos: importedTodos,
+          timelineTasks: importedTimeline,
+          attachments: importedAttachments
+        }
+      };
+    } catch (error) {
+      try {
+        run("ROLLBACK");
+      } catch {
+        // ignore
       }
-    });
-    persistDb();
-    return {
-      ok: true,
-      project: get("SELECT * FROM projects WHERE id = ?", [projectId]),
-      counts: {
-        notes: importedNotes,
-        todos: importedTodos,
-        timelineTasks: importedTimeline,
-        attachments: importedAttachments
-      }
-    };
+      console.error("Project bundle import failed", error);
+      return { ok: false, errorCode: "BUNDLE_IMPORT_FAILED", error: error?.message || "Failed to import bundle." };
+    }
   });
 
   ipcMain.handle("dashboard:deadlines", () => {
